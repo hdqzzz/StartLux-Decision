@@ -75,7 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--wave-max", type=int, default=128, help="most thought requests per wave (default 128)")
     g.add_argument("--wave-gather", type=float, default=0.3, help="seconds a wave waits for more requests (0.3)")
     g = p.add_argument_group("MLX backend")
-    g.add_argument("--mlx-kernels", choices=("off", "gs64"), default="off", help="experimental M5 INT8 prefill (changes probabilities; default off)")
+    g.add_argument("--mlx-kernels", choices=("off", "gs64", "gs64-mlp"), default="off", help="experimental M5 INT8 prefill (changes probabilities; default off)")
     g.add_argument("--mlx-prefix-cache", action="store_true", help="reuse an exact token prefix within causal text never requests")
     g = p.add_argument_group("other backends")
     g.add_argument("--llamacpp-url", default="http://127.0.0.1:8081", help="llama-server URL")

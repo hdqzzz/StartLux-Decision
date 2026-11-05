@@ -41,3 +41,22 @@ class KernelPolicyTest(unittest.TestCase):
         self.assertIs(type(m),original_mlp)
         self.assertIs(type(m.gate_proj),original_linear)
         self.assertIsNone(policy.last)
+
+    def test_mlp_only_leaves_other_projections_unwrapped(self):
+        class Layer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.mlp = lang.Qwen3_5MLP(256, 512)
+                self.attention_proj = nn.Linear(256, 256, bias=False)
+        class Body(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = [Layer()]
+        body=Body();body.set_dtype(mx.bfloat16);nn.quantize(body,bits=4,group_size=64)
+        original=type(body.layers[0].attention_proj)
+        policy=KernelPolicy(body,mlp_only=True)
+        try:
+            self.assertIs(type(body.layers[0].attention_proj),original)
+            out=body.layers[0].mlp(mx.ones((1,131,256),dtype=mx.bfloat16));mx.eval(out)
+            self.assertGreater(policy.counts['a8_mlp'],0)
+        finally:policy.close()

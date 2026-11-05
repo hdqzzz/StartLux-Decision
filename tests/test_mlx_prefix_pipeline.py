@@ -1,6 +1,5 @@
 """Prefix reuse stays request-local and does not bypass refusal or thinking paths."""
 import unittest
-from dataclasses import replace
 from startlux_decide.backends.fake import FakeBackend
 from startlux_decide.controls import Controls, RequestError
 from startlux_decide.pipeline import Decider

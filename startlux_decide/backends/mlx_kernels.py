@@ -24,7 +24,7 @@ def prepare_runtime():
 
 
 class KernelPolicy:
-    def __init__(self, body):
+    def __init__(self, body, mlp_only=False):
         import mlx.core as mx
         if mx.__version__ != "0.32.4" or md.version("mlx-vlm") != "0.7.10":
             raise RuntimeError("GS64 kernels are pinned to mlx0.32.4 and mlx-vlm0.7.10")
@@ -58,11 +58,15 @@ class KernelPolicy:
                     u = a8.apply_plan(up, shared, up_plan)
                     h = lang.swiglu(g, u)
                     owner.counts["a8_mlp"] += 1
+                    owner.counts["mlp_gate_up_shared"] += 1
                     return a8.apply_plan(down, owner.stage(h, dp), dp)
                 return lang.Qwen3_5MLP.__call__(module, x)
 
         # Materialize before changing classes: named_modules need not understand wrappers.
-        for _, module in list(body.named_modules()):
+        root_is_mlp = isinstance(body, lang.Qwen3_5MLP)
+        for name, module in list(body.named_modules()):
+            if mlp_only and not root_is_mlp and not (isinstance(module, lang.Qwen3_5MLP) or ".mlp." in name):
+                continue
             original = type(module)
             if isinstance(module, nn.QuantizedLinear):
                 plan = a8.classify_linear(module)

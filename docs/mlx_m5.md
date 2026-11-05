@@ -16,6 +16,11 @@ single-pass quantization/layout fusion preserve that GS64 result. Validate the
 model and your decision boundaries before enabling it. Instant is refused for
 this experimental kernel mode. The context guard applies to MLX with either flag.
 
+`--mlx-kernels gs64-mlp` limits the same activation/packing optimization to
+MLP modules. Attention and GDN projections use the original math. A fixed27B
+calibration found this scope more faithful than full eligible-decoder GS64;
+model-scale validation is still required.
+
 ## Pinned runtime
 
 Tested on M5 Pro, macOS27, Python3.12, mlx0.32.4, mlx-vlm0.7.10 and

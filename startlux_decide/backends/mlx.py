@@ -185,7 +185,7 @@ class MLXBackend(Backend):
         self.path, self.tokenizer, self.bidirectional = path, tokenizer, bidirectional
         self.prefill_chunk = max(int(prefill_chunk), 1)
         self.prefix_cache = prefix_cache
-        if kernels not in ("off", "gs64") or (kernels != "off" and bidirectional):
+        if kernels not in ("off", "gs64", "gs64-mlp") or (kernels != "off" and bidirectional):
             raise ValueError("MLX gs64 kernels require a causal model")
         self.kernels, self.kernel_policy = kernels, None
         self.config: dict = {}
@@ -229,9 +229,9 @@ class MLXBackend(Backend):
                 self.processor = None
         self.eos = _eos_ids(self.config, text, folder, self.tokenizer)
         self.check = self._self_check()
-        if self.kernels == "gs64":
+        if self.kernels in ("gs64", "gs64-mlp"):
             from .mlx_kernels import KernelPolicy
-            self.kernel_policy = KernelPolicy(self.body)
+            self.kernel_policy = KernelPolicy(self.body, mlp_only=self.kernels == "gs64-mlp")
 
     async def close(self) -> None:
         self._executor.shutdown(wait=True)
