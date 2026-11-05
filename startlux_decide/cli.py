@@ -75,6 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--wave-max", type=int, default=128, help="most thought requests per wave (default 128)")
     g.add_argument("--wave-gather", type=float, default=0.3, help="seconds a wave waits for more requests (0.3)")
     g = p.add_argument_group("MLX backend")
+    g.add_argument("--mlx-kernels", choices=("off", "gs64"), default="off", help="experimental M5 INT8 prefill (changes probabilities; default off)")
     g.add_argument("--mlx-prefix-cache", action="store_true", help="reuse an exact token prefix within causal text never requests")
     g = p.add_argument_group("other backends")
     g.add_argument("--llamacpp-url", default="http://127.0.0.1:8081", help="llama-server URL")
@@ -233,7 +234,7 @@ def cmd_serve(a: argparse.Namespace) -> int:
             backend = LlamaCppBackend(a.llamacpp_url, tokenizer, folder.bidirectional)
         else:
             from .backends.mlx import MLXBackend
-            backend = MLXBackend(a.model, tokenizer, folder.bidirectional, prefix_cache=a.mlx_prefix_cache)
+            backend = MLXBackend(a.model, tokenizer, folder.bidirectional, prefix_cache=a.mlx_prefix_cache, kernels=a.mlx_kernels)
         images = {"max_images": 0 if a.no_images else a.max_images, "max_pixels": a.max_pixels}
         app = create_app(folder, backend, name, defaults, max_budget, a.max_model_len, options, images)
         scheme = "https" if tls else "http"

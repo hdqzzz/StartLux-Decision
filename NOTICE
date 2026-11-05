@@ -1,0 +1,11 @@
+M5 MLX optimization additions, 2026-11-05
+
+startlux_decide/backends/_mlx_a8.py is adapted from the oMLX0.7.3
+Qwen INT8 prefill helper. Unused model installers and MoE imports were removed;
+no native quantization or matmul formulas were changed.
+https://github.com/jundot/omlx (Apache-2.0)
+
+startlux_decide/backends/_mlx_stage.py adapts oMLX Stage A quantization
+(commit2165e75726ba83d9651dbaced61c97728da77bba): GS64 activation
+quantization, v8 permutation and metadata transposition are combined.
+The downloaded native subset retains its upstream Apache-2.0 license.

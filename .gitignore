@@ -13,3 +13,7 @@ bench_*.csv
 .pytest_cache/
 .venv/
 *.log
+
+# Downloaded native runtime and local evaluation data
+third_party/omlx-runtime/
+.local-eval/

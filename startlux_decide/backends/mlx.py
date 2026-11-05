@@ -181,10 +181,13 @@ class MLXBackend(Backend):
     name = "mlx"
 
     def __init__(self, path: str, tokenizer: Any, bidirectional: bool, prefill_chunk: int = PREFILL_CHUNK,
-                 prefix_cache: bool = False):
+                 prefix_cache: bool = False, kernels: str = "off"):
         self.path, self.tokenizer, self.bidirectional = path, tokenizer, bidirectional
         self.prefill_chunk = max(int(prefill_chunk), 1)
         self.prefix_cache = prefix_cache
+        if kernels not in ("off", "gs64") or (kernels != "off" and bidirectional):
+            raise ValueError("MLX gs64 kernels require a causal model")
+        self.kernels, self.kernel_policy = kernels, None
         self.config: dict = {}
         self.model = self.lm = self.body = self.vision = self.processor = None
         self.layers: list = []
@@ -226,9 +229,14 @@ class MLXBackend(Backend):
                 self.processor = None
         self.eos = _eos_ids(self.config, text, folder, self.tokenizer)
         self.check = self._self_check()
+        if self.kernels == "gs64":
+            from .mlx_kernels import KernelPolicy
+            self.kernel_policy = KernelPolicy(self.body)
 
     async def close(self) -> None:
         self._executor.shutdown(wait=True)
+        if self.kernel_policy is not None:
+            self.kernel_policy.close()
 
     def describe(self) -> dict:
         import importlib.metadata as md
@@ -241,7 +249,9 @@ class MLXBackend(Backend):
                 return None
 
         return {"name": self.name, "prompt_attention": "bidirectional" if self.bidirectional else "causal",
-                "images": self.reads_images, "quantization": self.config.get("quantization"),
+                "images": self.reads_images, "prefix_cache": self.prefix_cache, "kernels": self.kernels,
+                "kernel_stats": dict(self.kernel_policy.counts) if self.kernel_policy is not None else None,
+                "quantization": self.config.get("quantization"),
                 "mlx": mx.__version__, "mlx_vlm": version("mlx-vlm"), "prompt_attention_check": self.check}
 
     # ------------------------------------------------------------------------------------------- forward pass
@@ -260,6 +270,8 @@ class MLXBackend(Backend):
         import mlx.core as mx
         import numpy as np
 
+        if self.kernel_policy is not None:
+            self.kernel_policy.reset()
         positions = mx.array(np.asarray(pos, dtype=np.int32).reshape(3, 1, -1))
         h, shared = embeds, None
         first = next((layer for layer in self.layers if not layer.is_linear), None)
