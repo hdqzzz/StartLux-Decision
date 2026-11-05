@@ -299,6 +299,11 @@ class Decider:
         req.shared_tokens = n
 
     async def _read(self, lane: Backend, prompt: str, k: int, question_type: str, req: _Request) -> list[float]:
+        # Fork change: enforce the advertised MLX context limit before GPU work.
+        if lane.name == "mlx":
+            tokens = count_tokens(self.tok, prompt) + req.extra_tokens
+            if tokens > self.context_length:
+                raise BackendRequestError(f"prompt has {tokens} tokens, exceeding context length {self.context_length}")
         z = await lane.readout(prompt, self.letter_ids[:k], **req.kw())
         return probabilities(z, self.folder.temperature(question_type))
 
