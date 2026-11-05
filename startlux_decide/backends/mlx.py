@@ -1,3 +1,4 @@
+# Fork changes (2026-11-05): opt-in request-local MLX prefix reuse; context guard retained.
 """In-process engine on Apple Silicon with mlx-vlm: text and images, Instant and AutoThink folders.
 
 The forward pass runs in mlx-vlm's implementation of the model (the folder's language model and vision tower); the
@@ -28,8 +29,10 @@ Everything runs on one thread (MLX streams belong to the thread that made them);
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Sequence
@@ -39,6 +42,7 @@ from .base import Backend, BackendRequestError, Generation, Sampling
 
 CACHE_LIMIT_BYTES = 1 << 30           # MLX's buffer cache (freed GPU buffers kept for reuse)
 PREFILL_CHUNK = 8192                  # tokens per step when a causal prompt is read into a cache
+PREFIX_MIN = 256                     # shorter shared inputs do not justify a separate prefix pass
 
 
 # ----------------------------------------------------------------------------------------------- pure helpers
@@ -144,15 +148,43 @@ def sample_tokens(logits: Any, u: Any, temperature: float, top_k: int, top_p: fl
 
 
 # ----------------------------------------------------------------------------------------------- the engine
+class _PrefixLane(Backend):
+    """One request's immutable prefix; every question restores its own native hybrid cache."""
+
+    name = "mlx"
+
+    def __init__(self, backend, ids, snapshots, nbytes, prefill_ms):
+        self.backend, self.tokenizer = backend, backend.tokenizer
+        self.ids, self.snapshots = tuple(ids), snapshots
+        self.shared_tokens = len(ids)
+        self.nbytes, self.prefill_ms = nbytes, prefill_ms
+        self.evaluated_tokens, self.reused_tokens = len(ids), 0
+
+    @property
+    def cache_stats(self):
+        return {"shared_tokens": self.shared_tokens, "saved_tokens": max(0, self.reused_tokens - self.shared_tokens),
+                "evaluated_tokens": self.evaluated_tokens, "snapshot_bytes": self.nbytes,
+                "prefill_ms": round(self.prefill_ms, 3)}
+
+    async def readout(self, prompt, letter_ids, media=None):
+        return await asyncio.get_running_loop().run_in_executor(
+            self.backend._executor, self.backend._readout, prompt, list(letter_ids), media, self)
+
+    async def generate(self, prompt, max_tokens, sampling, stop, seed, media=None):
+        return await self.backend.generate(prompt, max_tokens, sampling, stop, seed, media)
+
+
 class MLXBackend(Backend):
     """`path`: an MLX model folder (see the module docstring) with decision_config.json next to it; `bidirectional`: an
     Instant folder (it answers in one pass and does not generate)."""
 
     name = "mlx"
 
-    def __init__(self, path: str, tokenizer: Any, bidirectional: bool, prefill_chunk: int = PREFILL_CHUNK):
+    def __init__(self, path: str, tokenizer: Any, bidirectional: bool, prefill_chunk: int = PREFILL_CHUNK,
+                 prefix_cache: bool = False):
         self.path, self.tokenizer, self.bidirectional = path, tokenizer, bidirectional
         self.prefill_chunk = max(int(prefill_chunk), 1)
+        self.prefix_cache = prefix_cache
         self.config: dict = {}
         self.model = self.lm = self.body = self.vision = self.processor = None
         self.layers: list = []
@@ -328,18 +360,56 @@ class MLXBackend(Backend):
         return w
 
     # ------------------------------------------------------------------------------------------- read-out
+    async def share_prefix(self, prompts: Sequence[str], media: Any = None) -> Backend | None:
+        """Read an exact token prefix once, scoped to this text-only causal request."""
+        if not self.prefix_cache or self.bidirectional or media is not None or len(prompts) < 2:
+            return None
+        return await asyncio.get_running_loop().run_in_executor(self._executor, self._share_prefix, list(prompts))
+
+    def _share_prefix(self, prompts: list[str]) -> Backend | None:
+        import mlx.core as mx
+        import numpy as np
+
+        started = time.perf_counter()
+        tokens = [self.tokenizer.encode(p, add_special_tokens=False) for p in prompts]
+        n = min(len(t) for t in tokens) - 1       # retain a final token to produce each read-out
+        for other in tokens[1:]:
+            n = next((i for i in range(n) if tokens[0][i] != other[i]), n)
+        if n < PREFIX_MIN:
+            return None
+        ids = tokens[0][:n]
+        cache = self.lm.make_cache()
+        embeds = self.body.embed_tokens(mx.array(ids)[None])
+        self._prefill(embeds, np.broadcast_to(np.arange(n), (3, n)), cache)
+        snapshots = [c.prefix_cache_snapshot() for c in cache]
+        return _PrefixLane(self, ids, snapshots, sum(c.nbytes for c in cache),
+                           (time.perf_counter() - started) * 1000)
+
     async def readout(self, prompt: str, letter_ids: Sequence[int], media: Any = None) -> list[float]:
         return await asyncio.get_running_loop().run_in_executor(self._executor, self._readout, prompt,
                                                                 list(letter_ids), media)
 
-    def _readout(self, prompt: str, letter_ids: list[int], media: Any = None) -> list[float]:
+    def _readout(self, prompt: str, letter_ids: list[int], media: Any = None,
+                 prefix: _PrefixLane | None = None) -> list[float]:
         import mlx.core as mx
 
         ids, embeds, pos, _ = self._inputs(prompt, media)
-        if self.bidirectional or len(ids) <= self.prefill_chunk:
+        n = prefix.shared_tokens if prefix is not None else 0
+        if prefix is not None and media is None and len(ids) > n and tuple(ids[:n]) == prefix.ids:
+            cache = self.lm.make_cache()
+            for c, snapshot in zip(cache, prefix.snapshots):
+                c.prefix_cache_restore(copy.deepcopy(snapshot))
+            h = self._prefill(embeds[:, n:], pos[:, n:], cache)
+            prefix.reused_tokens += n
+            prefix.evaluated_tokens += len(ids) - n
+        elif self.bidirectional or len(ids) <= self.prefill_chunk:
             h = self._forward(embeds, pos, None if self.bidirectional else "causal")[:, -1]
+            if prefix is not None:
+                prefix.evaluated_tokens += len(ids)
         else:                                                        # a long causal prompt, a chunk at a time
             h = self._prefill(embeds, pos, self.lm.make_cache())
+            if prefix is not None:
+                prefix.evaluated_tokens += len(ids)
         z = h.astype(mx.float32) @ self._letter_rows(letter_ids).T
         return z[0].tolist()
 

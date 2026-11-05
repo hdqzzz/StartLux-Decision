@@ -1,3 +1,4 @@
+# Fork changes (2026-11-05): opt-in request-local MLX prefix reuse; context guard retained.
 """The decision pipeline. Every question of a request runs as its own task, so no question waits for another one's
 thought, and many requests can be in flight at once.
 
@@ -251,12 +252,20 @@ class Decider:
             state, req.media = self._images(state, images)
             req.extra_tokens = sum(t - 1 for t in req.media.tokens)
         items = self.prepare(state, questions, req, ctl.allow_none, ctl.none_check)
-        await self._share(items, req)
+        if not getattr(self.backend, "prefix_cache", False) or ctl.think_mode == "never":
+            await self._share(items, req)
         outcomes = await _gather([self._question(state, q, ctl, req) for q in items])
         spans = [o.thought for o in outcomes if o.thought]
+        usage = {"input_tokens": sum(o.input_tokens for o in outcomes),
+                 "output_tokens": sum(o.output_tokens for o in outcomes)}
+        stats = getattr(req.lane, "cache_stats", None)
+        if stats is not None:
+            usage["input_tokens_details"] = {"cached_tokens": stats["saved_tokens"],
+                                             "evaluated_tokens": stats["evaluated_tokens"],
+                                             "prefix_tokens": stats["shared_tokens"],
+                                             "snapshot_bytes": stats["snapshot_bytes"]}
         return Decision(answers={q.key: o.answer for q, o in zip(items, outcomes)},
-                        usage={"input_tokens": sum(o.input_tokens for o in outcomes),
-                               "output_tokens": sum(o.output_tokens for o in outcomes)},
+                        usage=usage,
                         timing_ms={"wall": _ms(time.perf_counter() - t0),
                                    "first_pass_sum": round(sum(o.first_ms for o in outcomes), 3),
                                    "thought_span": _ms(max(e for _, e in spans) - min(s for s, _ in spans))
@@ -282,11 +291,20 @@ class Decider:
     async def _share(self, items: list[_Question], req: _Request) -> None:
         """A long state shared by several questions is read once (module docstring): the shared beginning of their
         one-pass prompts goes into the engine's prefix cache, and the questions run on that server."""
-        if not self.backend.caches_prefixes or self.folder.bidirectional:
+        if self.folder.bidirectional or not (self.backend.caches_prefixes or
+                                            getattr(self.backend, "prefix_cache", False)):
             return
         prompts = [p for q in items for p in q.group_prompts]
         prompts += [plain_prompt(self.tok, q.msgs) for q in items if q.msgs is not None]
         if len(prompts) < 2:
+            return
+        share = getattr(self.backend, "share_prefix", None)
+        if share is not None:
+            if all(count_tokens(self.tok, p) + req.extra_tokens <= self.context_length for p in prompts):
+                req.lane = await share(prompts, **req.kw())
+                req.shared_tokens = req.lane.shared_tokens if req.lane is not None else 0
+            return
+        if not self.backend.caches_prefixes:
             return
         prefix = os.path.commonprefix(prompts)
         if req.media is not None and prefix.count(IMAGE_PLACEHOLDER) != len(req.media):
@@ -299,7 +317,6 @@ class Decider:
         req.shared_tokens = n
 
     async def _read(self, lane: Backend, prompt: str, k: int, question_type: str, req: _Request) -> list[float]:
-        # Fork change: enforce the advertised MLX context limit before GPU work.
         if lane.name == "mlx":
             tokens = count_tokens(self.tok, prompt) + req.extra_tokens
             if tokens > self.context_length:
